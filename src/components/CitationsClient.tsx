@@ -17,6 +17,11 @@ type FieldDiff = {
   matchScore?: number;
 };
 
+type FieldCheck = FieldDiff & {
+  ok: boolean;
+  citedMissing?: boolean;
+};
+
 type CiteResult = {
   index: number;
   raw: string;
@@ -30,6 +35,7 @@ type CiteResult = {
   sources: string[];
   driftFields: string[];
   fieldDiffs?: FieldDiff[];
+  fieldChecks?: FieldCheck[];
   links: { label: string; url: string }[];
   record?: {
     title?: string;
@@ -88,7 +94,8 @@ const EXPORTABLE: CiteStatus[] = ["ok", "review"];
 
 const SAMPLE = `1. Polack FP, Thomas SJ, Kitchin N, et al. Safety and Efficacy of the BNT162b2 mRNA Covid-19 Vaccine. N Engl J Med. 2020;383:2603-2615. doi:10.1056/NEJMoa2034577
 2. Fake Fan. Completely fabricated imaginary paper about miracle cure. Fake Journal. 2024. doi:10.1234/fake.doi.9999
-3. Wolchok JD, et al. Overall Survival with Combined Nivolumab and Ipilimumab in Advanced Melanoma. N Engl J Med. 2017;377(14):1345-1356. doi:10.1056/NEJMoa1709684`;
+3. Wolchok JD, et al. Overall Survival with Combined Nivolumab and Ipilimumab in Advanced Melanoma. N Engl J Med. 2017;377(14):1345-1356. PMID: 28889792
+4. Harris PA, Taylor R, Thielke R, et al. Research electronic data capture (REDCap)--a metadata-driven methodology and workflow process for providing translational research informatics support. J Biomed Inform. 2009;42(2):377-381.`;
 
 function CitationsInner() {
   const searchParams = useSearchParams();
@@ -369,27 +376,56 @@ function CitationsInner() {
                   <p className="text-sm font-semibold text-ink">{r.title || r.raw.slice(0, 110)}</p>
                   <p className="mt-1 text-xs leading-relaxed text-ink-soft">{r.message}</p>
 
-                  {r.fieldDiffs && r.fieldDiffs.length ? (
-                    <div className="mt-2 space-y-1.5 rounded-md border border-line bg-[#fbfcfc] px-2.5 py-2">
-                      {r.fieldDiffs.map((d) => (
-                        <div key={`${r.index}-${d.field}`} className="text-[11px] leading-relaxed">
-                          <span className="font-medium text-ink-soft">{d.label}</span>
-                          <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
-                            <span className="rounded bg-red-50 px-1.5 py-0.5 text-red-800 line-through decoration-red-300">
-                              {d.cited}
-                            </span>
-                            <span className="text-ink-soft">→</span>
-                            <span className="rounded bg-teal/10 px-1.5 py-0.5 text-teal-deep">
-                              {d.resolved}
-                              {typeof d.matchScore === "number" && d.matchScore < 1
-                                ? ` (${Math.round(d.matchScore * 100)}%)`
-                                : ""}
-                            </span>
+                  {(() => {
+                    const rows: FieldCheck[] =
+                      r.fieldChecks && r.fieldChecks.length
+                        ? r.fieldChecks
+                        : (r.fieldDiffs || []).map((d) => ({ ...d, ok: false as const }));
+                    if (!rows.length) return null;
+                    return (
+                      <div className="mt-2 space-y-1.5 rounded-md border border-line bg-[#fbfcfc] px-2.5 py-2">
+                        <p className="text-[10px] font-medium uppercase tracking-wide text-ink-soft">
+                          字段核对（引用中 → 库内）
+                        </p>
+                        {rows.map((d) => (
+                          <div key={`${r.index}-${d.field}-${d.ok ? "ok" : "bad"}`} className="text-[11px] leading-relaxed">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-medium text-ink-soft">{d.label}</span>
+                              <span
+                                className={`rounded px-1 py-0.5 text-[10px] ${
+                                  d.ok
+                                    ? d.citedMissing
+                                      ? "bg-mist text-ink-soft"
+                                      : "bg-teal/10 text-teal-deep"
+                                    : "bg-red-50 text-red-800"
+                                }`}
+                              >
+                                {d.ok ? (d.citedMissing ? "未提取" : "一致") : "不一致"}
+                              </span>
+                            </div>
+                            <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+                              <span
+                                className={`rounded px-1.5 py-0.5 ${
+                                  d.ok
+                                    ? "bg-white text-ink-soft"
+                                    : "bg-red-50 text-red-800 line-through decoration-red-300"
+                                }`}
+                              >
+                                {d.cited}
+                              </span>
+                              <span className="text-ink-soft">→</span>
+                              <span className="rounded bg-teal/10 px-1.5 py-0.5 text-teal-deep">
+                                {d.resolved}
+                                {typeof d.matchScore === "number" && d.matchScore < 1 && !d.ok
+                                  ? ` (${Math.round(d.matchScore * 100)}%)`
+                                  : ""}
+                              </span>
+                            </div>
                           </div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
+                        ))}
+                      </div>
+                    );
+                  })()}
 
                   <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-accent">
                     {!hasYuanwenLink && r.doi ? (

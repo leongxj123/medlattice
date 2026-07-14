@@ -101,7 +101,13 @@ export function titleSimilarityScore(a?: string, b?: string, opts?: { strict?: b
   const lenRatio = Math.min(na.length, nb.length) / Math.max(na.length, nb.length);
 
   if (na.includes(nb) || nb.includes(na)) {
-    return Math.min(opts?.strict ? 0.98 : 0.99, Math.max(f1, lenRatio * (opts?.strict ? 0.92 : 0.95)));
+    // Strict citation mode: truncated / expanded titles must not look "almost perfect"
+    if (opts?.strict) {
+      const ratio = Math.min(na.length, nb.length) / Math.max(na.length, nb.length);
+      if (ratio < 0.92) return Math.min(f1, ratio * 0.9 + 0.05);
+      return Math.min(0.94, Math.max(f1, ratio * 0.9));
+    }
+    return Math.min(0.99, Math.max(f1, lenRatio * 0.95));
   }
 
   if (opts?.strict) {

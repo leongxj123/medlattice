@@ -1,5 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
-import { encodeQuery, fetchJson, CONTACT_EMAIL, reconstructAbstract, stripDoi } from "@/lib/http";
+import {
+  encodeQuery,
+  fetchJson,
+  CONTACT_EMAIL,
+  reconstructAbstract,
+  stripDoi,
+  pubmedSearchMeta,
+  pubmedSummaries,
+} from "@/lib/http";
 import {
   buildFormats,
   fromCrossrefAuthors,
@@ -16,6 +24,13 @@ export type FieldDiff = {
   cited: string;
   resolved: string;
   matchScore?: number;
+};
+
+/** Full field-by-field checklist (matched + mismatched) for UI verification. */
+export type FieldCheck = FieldDiff & {
+  ok: boolean;
+  /** cited side could not be parsed from the reference string */
+  citedMissing?: boolean;
 };
 
 const EMPTY_FORMATS = { apa: "", gbt: "", bibtex: "" } as const;
@@ -62,6 +77,7 @@ export type CiteResult = {
   sources: string[];
   driftFields: string[];
   fieldDiffs: FieldDiff[];
+  fieldChecks?: FieldCheck[];
   links: { label: string; url: string }[];
   record?: SourceRecord | null;
   formats: {
@@ -171,7 +187,10 @@ function extractDoi(text: string) {
 }
 
 function extractPmid(text: string) {
-  const m = text.match(/\bPMID[:\s]*([0-9]{5,9})\b/i);
+  const m =
+    text.match(/\bPMID[:\s]*([0-9]{5,9})\b/i) ||
+    text.match(/\bPubMed(?:\s*ID)?[:\s]*([0-9]{5,9})\b/i) ||
+    text.match(/pubmed\.ncbi\.nlm\.nih\.gov\/(?:\w+\/)?(\d{5,9})\b/i);
   return m ? m[1] : null;
 }
 
@@ -401,7 +420,8 @@ function authorInitialsKey(name?: string, family?: string) {
 }
 
 function authorMatchScore(hint?: string, resolved?: string) {
-  if (!hint?.trim() || !resolved?.trim()) return 1;
+  if (!hint?.trim()) return 1; // nothing to verify from cited side
+  if (!resolved?.trim()) return 0;
   const h = normalize(hint);
   const r = normalize(resolved);
   const hParts = h.split(" ").filter(Boolean);
@@ -421,106 +441,165 @@ function authorMatchScore(hint?: string, resolved?: string) {
   return 0.2;
 }
 
-/** Compare cited hints vs resolved record; mutate diffs/drift. */
+type CompareOpts = {
+  titleHint?: string;
+  authorHint?: string;
+  yearHint?: string | null;
+  containerHint?: string;
+  volumeHint?: string;
+  issueHint?: string;
+  pagesHint?: string;
+  pmidHint?: string | null;
+  title?: string;
+  firstAuthor?: string;
+  year?: string | number;
+  container?: string;
+  volume?: string | number;
+  issue?: string | number;
+  pages?: string;
+  pmid?: string;
+  /** Stricter when DOI already anchors the work */
+  strict?: boolean;
+};
+
+/** Compare cited hints vs resolved record; mutate diffs/drift; return full checklist. */
 function compareCitedToResolved(
   fieldDiffs: FieldDiff[],
   driftFields: string[],
-  opts: {
-    titleHint?: string;
-    authorHint?: string;
-    yearHint?: string | null;
-    containerHint?: string;
-    volumeHint?: string;
-    issueHint?: string;
-    pagesHint?: string;
-    pmidHint?: string | null;
-    title?: string;
-    firstAuthor?: string;
-    year?: string | number;
-    container?: string;
-    volume?: string | number;
-    issue?: string | number;
-    pages?: string;
-    pmid?: string;
-    /** Stricter when DOI already anchors the work */
-    strict?: boolean;
-  },
-) {
+  opts: CompareOpts,
+): FieldCheck[] {
   const strict = opts.strict !== false;
-  const titleFloor = strict ? 0.9 : 0.45;
+  // DOI-anchored refs: even small title edits should surface as 需复核
+  const titleFloor = strict ? 0.95 : 0.55;
   const authorFloor = 0.99;
-  const journalFloor = strict ? 0.72 : 0.45;
+  const journalFloor = strict ? 0.78 : 0.5;
+  const checks: FieldCheck[] = [];
 
-  // Any year mismatch counts (user may change 2009 → 2010)
-  if (opts.yearHint && opts.year != null && String(opts.yearHint) !== String(opts.year)) {
-    const gap = Math.abs(Number(opts.yearHint) - Number(opts.year));
-    if (!Number.isNaN(gap)) {
-      pushDiff(fieldDiffs, driftFields, "year", "年份", opts.yearHint, String(opts.year), gap <= 1 ? 0.35 : 0);
+  const note = (
+    field: FieldDiff["field"],
+    label: string,
+    citedRaw: string | undefined | null,
+    resolvedRaw: string | undefined | null,
+    score: number,
+    floor: number,
+    optsExtra?: { citedMissing?: boolean; skipDrift?: boolean },
+  ) => {
+    const cited = (citedRaw || "").trim();
+    const resolved = (resolvedRaw || "").trim();
+    if (!cited && !resolved) return;
+
+    if (!cited) {
+      checks.push({
+        field,
+        label,
+        cited: "（引用中未提取）",
+        resolved: resolved || "—",
+        matchScore: undefined,
+        ok: true,
+        citedMissing: true,
+      });
+      return;
+    }
+
+    if (!resolved) {
+      // Library lacks this field — show for transparency, but don't mark as drift
+      checks.push({
+        field,
+        label,
+        cited,
+        resolved: "（库内无）",
+        matchScore: undefined,
+        ok: true,
+      });
+      return;
+    }
+
+    const ok = score >= floor;
+    checks.push({
+      field,
+      label,
+      cited: cited.slice(0, 120),
+      resolved: resolved.slice(0, 120),
+      matchScore: score,
+      ok,
+      citedMissing: optsExtra?.citedMissing,
+    });
+    if (!ok && !optsExtra?.skipDrift) {
+      pushDiff(fieldDiffs, driftFields, field, label, cited.slice(0, 120), resolved.slice(0, 120), score);
+    }
+  };
+
+  // Year: exact match preferred; ±1 (print vs online) accepted; larger gaps flag
+  if (opts.yearHint || opts.year != null) {
+    const cited = opts.yearHint ? String(opts.yearHint) : "";
+    const resolved = opts.year != null ? String(opts.year) : "";
+    let score = 1;
+    if (cited && resolved && cited !== resolved) {
+      const gap = Math.abs(Number(cited) - Number(resolved));
+      score = !Number.isNaN(gap) && gap <= 1 ? 0.92 : 0;
+    }
+    note("year", "年份", cited || undefined, resolved || undefined, score, 0.9);
+  }
+
+  {
+    const cited = (opts.titleHint || "").trim();
+    const resolved = (opts.title || "").trim();
+    const score =
+      cited.length >= 8 && resolved
+        ? titleSimilarityScore(cited, resolved)
+        : cited.length >= 8
+          ? 0
+          : 1;
+    if (cited.length >= 8 || resolved) {
+      note("title", "标题", cited.length >= 8 ? cited : undefined, resolved || undefined, score, titleFloor);
     }
   }
 
-  if ((opts.titleHint || "").length >= 12) {
-    const score = titleSimilarityScore(opts.titleHint, opts.title);
-    if (score < titleFloor) {
-      pushDiff(
-        fieldDiffs,
-        driftFields,
-        "title",
-        "标题",
-        (opts.titleHint || "").slice(0, 100),
-        (opts.title || "").slice(0, 100),
-        score,
-      );
-    }
+  {
+    const cited = (opts.authorHint || "").trim();
+    const resolved = (opts.firstAuthor || "").trim();
+    const score = authorMatchScore(cited || undefined, resolved || undefined);
+    note("first_author", "第一作者", cited || undefined, resolved || undefined, score, authorFloor);
   }
 
-  const authorScore = authorMatchScore(opts.authorHint, opts.firstAuthor);
-  if (authorScore < authorFloor) {
-    pushDiff(
-      fieldDiffs,
-      driftFields,
-      "first_author",
-      "第一作者",
-      opts.authorHint || "—",
-      opts.firstAuthor || "—",
-      authorScore,
-    );
+  {
+    const cited = (opts.containerHint || "").trim();
+    const resolved = (opts.container || "").trim();
+    const score = cited && resolved ? journalMatchScore(cited, resolved) : cited ? 0 : 1;
+    note("container", "期刊", cited || undefined, resolved || undefined, score, journalFloor);
   }
 
-  if (opts.containerHint && opts.container) {
-    const score = journalMatchScore(opts.containerHint, opts.container);
-    if (score < journalFloor) {
-      pushDiff(
-        fieldDiffs,
-        driftFields,
-        "container",
-        "期刊",
-        opts.containerHint.slice(0, 80),
-        opts.container.slice(0, 80),
-        score,
-      );
-    }
+  {
+    const cited = opts.volumeHint ? String(opts.volumeHint).trim() : "";
+    const resolved = opts.volume != null ? String(opts.volume).trim() : "";
+    const score = cited && resolved ? (cited === resolved ? 1 : 0) : cited ? 0 : 1;
+    note("volume", "卷号", cited || undefined, resolved || undefined, score, 0.99);
   }
 
-  if (opts.volumeHint && opts.volume != null && String(opts.volumeHint) !== String(opts.volume).trim()) {
-    pushDiff(fieldDiffs, driftFields, "volume", "卷号", opts.volumeHint, String(opts.volume), 0);
+  {
+    const cited = opts.issueHint ? String(opts.issueHint).trim() : "";
+    const resolved = opts.issue != null ? String(opts.issue).trim() : "";
+    const score = cited && resolved ? (cited === resolved ? 1 : 0) : cited ? 0 : 1;
+    note("issue", "期号", cited || undefined, resolved || undefined, score, 0.99);
   }
 
-  if (opts.issueHint && opts.issue != null && String(opts.issueHint) !== String(opts.issue).trim()) {
-    pushDiff(fieldDiffs, driftFields, "issue", "期号", opts.issueHint, String(opts.issue), 0);
+  {
+    const cited = (opts.pagesHint || "").trim();
+    const resolved = (opts.pages || "").trim();
+    const a = normalizePages(cited);
+    const b = normalizePages(resolved);
+    const score = a && b ? (a === b ? 1 : 0) : a ? 0 : 1;
+    note("pages", "页码", cited || undefined, resolved || undefined, score, 0.99);
   }
 
-  if (opts.pagesHint && opts.pages) {
-    const a = normalizePages(opts.pagesHint);
-    const b = normalizePages(opts.pages);
-    if (a && b && a !== b) {
-      pushDiff(fieldDiffs, driftFields, "pages", "页码", opts.pagesHint, opts.pages, 0);
-    }
+  {
+    const cited = (opts.pmidHint || "").trim();
+    const resolved = opts.pmid ? String(opts.pmid).replace(/\D/g, "") : "";
+    const score = cited && resolved ? (cited === resolved ? 1 : 0) : cited ? 0 : 1;
+    note("pmid", "PMID", cited || undefined, resolved || undefined, score, 0.99);
   }
 
-  if (opts.pmidHint && opts.pmid && String(opts.pmidHint) !== String(opts.pmid).replace(/\D/g, "")) {
-    pushDiff(fieldDiffs, driftFields, "pmid", "PMID", opts.pmidHint, String(opts.pmid).replace(/\D/g, ""), 0);
-  }
+  return checks;
 }
 
 function pushDiff(
@@ -648,6 +727,75 @@ async function lookupOpenAlexByDoi(doi: string): Promise<SourceRecord | null> {
   }
 }
 
+async function lookupOpenAlexByPmid(pmid: string): Promise<SourceRecord | null> {
+  const clean = pmid.replace(/\D/g, "");
+  if (!clean) return null;
+  try {
+    const oa = await fetchJson<OaWork>(
+      `https://api.openalex.org/works/pmid:${encodeURIComponent(clean)}?${encodeQuery({ mailto: CONTACT_EMAIL })}`,
+      { cache: "no-store", timeoutMs: 7000 },
+    );
+    if (!oa?.display_name) return null;
+    const rec = oaToRecord(oa);
+    rec.pmid = rec.pmid || clean;
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
+function recordFromPubmedSummary(s: {
+  pmid: string;
+  title: string;
+  source?: string;
+  pubdate?: string;
+  authors?: string;
+  doi?: string | null;
+}): SourceRecord | null {
+  if (!s.title || s.title === "Untitled") return null;
+  const year = s.pubdate?.match(/\b((?:19|20)\d{2})\b/)?.[1];
+  const first = (s.authors || "").split(",")[0]?.trim() || undefined;
+  const doi = stripDoi(s.doi) || undefined;
+  return {
+    title: s.title.replace(/\.$/, "").trim(),
+    authors: s.authors || undefined,
+    firstAuthor: first,
+    year: year || undefined,
+    container: s.source || undefined,
+    doi,
+    pmid: s.pmid,
+    url: doi ? `https://doi.org/${doi}` : `https://pubmed.ncbi.nlm.nih.gov/${s.pmid}/`,
+    sources: ["医学索引"],
+  };
+}
+
+/** Prefer `rich` bibliographic fields when present; keep durable IDs from base. */
+function overlayRecord(base: SourceRecord, rich: SourceRecord | null | undefined): SourceRecord {
+  if (!rich) return base;
+  return {
+    title: rich.title || base.title,
+    authors: rich.authors || base.authors,
+    authorList: rich.authorList?.length ? rich.authorList : base.authorList,
+    firstAuthor: rich.firstAuthor || base.firstAuthor,
+    year: rich.year ?? base.year,
+    container: rich.container || base.container,
+    doi: rich.doi || base.doi,
+    pmid: base.pmid || rich.pmid,
+    abstract: base.abstract || rich.abstract,
+    type: rich.type || base.type,
+    citedBy: rich.citedBy ?? base.citedBy,
+    volume: rich.volume ?? base.volume,
+    issue: rich.issue ?? base.issue,
+    pages: rich.pages || base.pages,
+    url: rich.url || base.url,
+    sources: Array.from(new Set([...(base.sources || []), ...(rich.sources || [])])),
+    matchScore:
+      base.matchScore != null || rich.matchScore != null
+        ? Math.max(base.matchScore || 0, rich.matchScore || 0)
+        : undefined,
+  };
+}
+
 async function searchTitleCandidates(titleHint: string, limit = 3) {
   if (!titleHint || titleHint.length < 12) return [] as SourceRecord[];
   try {
@@ -730,6 +878,183 @@ function formatsFromRecord(record: SourceRecord, fallbackAuthors?: string) {
     pages: record.pages,
     type: record.type,
   });
+}
+
+async function lookupCrossrefByDoi(doi: string): Promise<SourceRecord | null> {
+  try {
+    const crossref = await fetchJson<{
+      status: string;
+      message?: Parameters<typeof recordFromCrossref>[0];
+    }>(`https://api.crossref.org/works/${encodeURIComponent(doi)}`, {
+      cache: "no-store",
+      timeoutMs: 8000,
+    });
+    if (crossref.status === "ok" && crossref.message) return recordFromCrossref(crossref.message);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve PMID → canonical record (医学索引 + 文献库 + optional 登记库). */
+async function resolveByPmid(pmid: string): Promise<{ record: SourceRecord | null; secondHit: boolean }> {
+  const clean = pmid.replace(/\D/g, "");
+  if (!/^\d{5,9}$/.test(clean)) return { record: null, secondHit: false };
+
+  const [pmList, oa] = await Promise.all([
+    pubmedSummaries([clean]).catch(() => []),
+    lookupOpenAlexByPmid(clean),
+  ]);
+  const fromPm = pmList[0] ? recordFromPubmedSummary(pmList[0]) : null;
+  if (!fromPm && !oa) return { record: null, secondHit: false };
+
+  let record = fromPm && oa ? overlayRecord(fromPm, oa) : fromPm || oa!;
+  record.pmid = clean;
+  let secondHit = Boolean(fromPm && oa);
+
+  if (record.doi) {
+    const cr = await lookupCrossrefByDoi(record.doi);
+    if (cr) {
+      record = overlayRecord(record, cr);
+      record.pmid = clean;
+      secondHit = true;
+    }
+  }
+
+  if (!record.url) {
+    record.url = record.doi
+      ? `https://doi.org/${record.doi}`
+      : `https://pubmed.ncbi.nlm.nih.gov/${clean}/`;
+  }
+  return { record, secondHit };
+}
+
+async function searchPubmedByTitle(titleHint: string, limit = 3): Promise<SourceRecord[]> {
+  if (!titleHint || titleHint.length < 12) return [];
+  try {
+    const quoted = `"${titleHint.slice(0, 120).replace(/"/g, "")}"[Title]`;
+    let meta = await pubmedSearchMeta(quoted, limit);
+    if (!meta.ids.length) {
+      meta = await pubmedSearchMeta(titleHint.slice(0, 160), limit);
+    }
+    if (!meta.ids.length) return [];
+    const summaries = await pubmedSummaries(meta.ids.slice(0, limit));
+    return summaries
+      .map((s) => {
+        const rec = recordFromPubmedSummary(s);
+        if (!rec) return null;
+        rec.matchScore = titleSimilarityScore(titleHint, rec.title);
+        return rec;
+      })
+      .filter((r): r is SourceRecord => r != null && (r.matchScore || 0) >= 0.35)
+      .sort((a, b) => (b.matchScore || 0) - (a.matchScore || 0));
+  } catch {
+    return [];
+  }
+}
+
+async function searchCrossrefBibliographic(titleHint: string, limit = 3): Promise<SourceRecord[]> {
+  if (!titleHint || titleHint.length < 12) return [];
+  try {
+    const data = await fetchJson<{
+      message?: { items?: Parameters<typeof recordFromCrossref>[0][] };
+    }>(
+      `https://api.crossref.org/works?${encodeQuery({
+        "query.bibliographic": titleHint.slice(0, 200),
+        rows: String(Math.max(limit, 5)),
+      })}`,
+      { cache: "no-store", timeoutMs: 8000 },
+    );
+    return (data.message?.items || [])
+      .map((item) => {
+        const rec = recordFromCrossref(item);
+        rec.matchScore = titleSimilarityScore(titleHint, rec.title);
+        return rec;
+      })
+      .filter((r) => (r.matchScore || 0) >= 0.35)
+      .sort((a, b) => (b.matchScore || 0) - (a.matchScore || 0))
+      .slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+function dedupeCandidates(list: SourceRecord[]) {
+  const out: SourceRecord[] = [];
+  const seen = new Set<string>();
+  for (const c of list) {
+    const key =
+      (c.doi && `doi:${c.doi.toLowerCase()}`) ||
+      (c.pmid && `pmid:${c.pmid}`) ||
+      `t:${normalize(c.title).slice(0, 80)}`;
+    if (seen.has(key)) {
+      const idx = out.findIndex((x) => {
+        const k =
+          (x.doi && `doi:${x.doi.toLowerCase()}`) ||
+          (x.pmid && `pmid:${x.pmid}`) ||
+          `t:${normalize(x.title).slice(0, 80)}`;
+        return k === key;
+      });
+      if (idx >= 0) out[idx] = overlayRecord(out[idx], c);
+      continue;
+    }
+    seen.add(key);
+    out.push(c);
+  }
+  return out;
+}
+
+/**
+ * Composite score for no-DOI/no-PMID matching.
+ * Hard-penalize author/year conflicts so short/generic titles cannot falsely lock.
+ */
+function candidateCompositeScore(
+  c: SourceRecord,
+  hints: { titleHint?: string; authorHint?: string; yearHint?: string | null; containerHint?: string },
+) {
+  const titleScore = titleSimilarityScore(hints.titleHint, c.title);
+  if (titleScore < 0.55) return 0;
+
+  const authorScore = authorMatchScore(hints.authorHint, c.firstAuthor);
+  const hasAuthor = Boolean(hints.authorHint?.trim());
+  const hasYear = Boolean(hints.yearHint);
+  let yearScore = 1;
+  if (hasYear && c.year != null) {
+    const gap = Math.abs(Number(hints.yearHint) - Number(c.year));
+    yearScore = Number.isNaN(gap) ? 0.5 : gap === 0 ? 1 : gap === 1 ? 0.4 : 0;
+  }
+  const journalScore =
+    hints.containerHint && c.container ? journalMatchScore(hints.containerHint, c.container) : 1;
+
+  if (hasAuthor && authorScore < 0.5 && titleScore < 0.93) return Math.min(titleScore * 0.35, 0.4);
+  if (hasYear && yearScore === 0 && titleScore < 0.96) return Math.min(titleScore * 0.4, 0.45);
+
+  const authorW = hasAuthor ? 0.22 : 0.08;
+  const yearW = hasYear ? 0.15 : 0.08;
+  const journalW = hints.containerHint ? 0.08 : 0.04;
+  const titleW = 1 - authorW - yearW - journalW;
+  return titleScore * titleW + authorScore * authorW + yearScore * yearW + journalScore * journalW;
+}
+
+async function searchNoIdCandidates(
+  hints: { titleHint?: string; authorHint?: string; yearHint?: string | null; containerHint?: string },
+  limit = 5,
+) {
+  const titleHint = hints.titleHint || "";
+  if (titleHint.length < 12) return [] as Array<SourceRecord & { composite: number }>;
+
+  const [oa, pm, cr] = await Promise.all([
+    searchTitleCandidates(titleHint, 4),
+    searchPubmedByTitle(titleHint, 4),
+    searchCrossrefBibliographic(titleHint, 4),
+  ]);
+
+  const merged = dedupeCandidates([...oa, ...pm, ...cr]);
+  return merged
+    .map((c) => ({ ...c, composite: candidateCompositeScore(c, hints) }))
+    .filter((c) => c.composite >= 0.5)
+    .sort((a, b) => b.composite - a.composite)
+    .slice(0, limit);
 }
 
 async function verifyOne(raw: string, index: number): Promise<CiteResult> {
@@ -817,29 +1142,7 @@ async function verifyOne(raw: string, index: number): Promise<CiteResult> {
       if (crossref.status === "ok" && crossref.message) {
         sources.push("登记库");
         const record = recordFromCrossref(crossref.message);
-        const title = record.title;
-        const container = record.container;
-        const crYear = record.year;
         const resolvedDoi = record.doi || doi;
-        const firstAuthor = record.firstAuthor;
-
-        if (normalize(resolvedDoi) !== normalize(doi)) {
-          pushDiff(fieldDiffs, driftFields, "doi", "DOI", doi, resolvedDoi, 0);
-        }
-        compareCitedToResolved(
-          fieldDiffs,
-          driftFields,
-          compareOpts({
-            title,
-            firstAuthor,
-            year: crYear,
-            container,
-            volume: record.volume,
-            issue: record.issue,
-            pages: record.pages,
-            pmid: record.pmid,
-          }),
-        );
 
         let secondHit = false;
         const oa = await lookupOpenAlexByDoi(doi);
@@ -849,6 +1152,7 @@ async function verifyOne(raw: string, index: number): Promise<CiteResult> {
           if (!record.abstract && oa.abstract) record.abstract = oa.abstract;
           if (oa.citedBy != null) record.citedBy = oa.citedBy;
           if (oa.pmid) record.pmid = oa.pmid;
+          if (!record.firstAuthor && oa.firstAuthor) record.firstAuthor = oa.firstAuthor;
           if (!record.authorList?.length && oa.authorList?.length) {
             record.authorList = oa.authorList;
             record.authors = oa.authors;
@@ -856,22 +1160,46 @@ async function verifyOne(raw: string, index: number): Promise<CiteResult> {
           if (!record.volume && oa.volume) record.volume = oa.volume;
           if (!record.issue && oa.issue) record.issue = oa.issue;
           if (!record.pages && oa.pages) record.pages = oa.pages;
+          if (!record.container && oa.container) record.container = oa.container;
           record.sources = Array.from(new Set([...record.sources, ...oa.sources]));
-          // PMID may arrive only from OpenAlex — re-check after enrich
-          if (pmidHint && oa.pmid && String(pmidHint) !== String(oa.pmid).replace(/\D/g, "")) {
-            pushDiff(fieldDiffs, driftFields, "pmid", "PMID", pmidHint, String(oa.pmid).replace(/\D/g, ""), 0);
-          }
         } else {
           const dc = await lookupDatacite(doi);
           if (dc) {
             sources.push("数据登记");
             secondHit = true;
             if (!record.abstract && dc.abstract) record.abstract = dc.abstract;
+            if (!record.firstAuthor && dc.firstAuthor) record.firstAuthor = dc.firstAuthor;
+            if (!record.container && dc.container) record.container = dc.container;
             record.sources = Array.from(new Set([...record.sources, "数据登记"]));
           }
         }
 
-        const status: CiteStatus = driftFields.length ? (driftFields.includes("doi") ? "risk" : "review") : secondHit ? "ok" : "review";
+        // Compare AFTER enrich so volume/issue/pages/pmid from second source are checked
+        if (normalize(resolvedDoi) !== normalize(doi)) {
+          pushDiff(fieldDiffs, driftFields, "doi", "DOI", doi, resolvedDoi, 0);
+        }
+        const fieldChecks = compareCitedToResolved(
+          fieldDiffs,
+          driftFields,
+          compareOpts({
+            title: record.title,
+            firstAuthor: record.firstAuthor,
+            year: record.year,
+            container: record.container,
+            volume: record.volume,
+            issue: record.issue,
+            pages: record.pages,
+            pmid: record.pmid,
+          }),
+        );
+
+        const status: CiteStatus = driftFields.length
+          ? driftFields.includes("doi")
+            ? "risk"
+            : "review"
+          : secondHit
+            ? "ok"
+            : "review";
         return {
           index,
           raw,
@@ -879,16 +1207,17 @@ async function verifyOne(raw: string, index: number): Promise<CiteResult> {
           message: driftFields.length
             ? `DOI 可解析，但字段与库内记录不一致（${driftFields.map(driftLabel).join("、")}），请人工复核。`
             : secondHit
-              ? "DOI 有效，多源命中，标题/年份总体一致。右侧可直接核对库内信息页。"
-              : "DOI 有效；第二源未复核到，建议对照右侧库内信息确认。",
-          title,
-          firstAuthor,
+              ? "DOI 有效，多源命中；作者/标题/年份/期刊/卷期页已逐项核对一致。"
+              : "DOI 有效；第二源未复核到，已按登记库字段核对，建议再对照右侧库内信息。",
+          title: record.title,
+          firstAuthor: record.firstAuthor,
           doi: resolvedDoi || doi,
-          year: crYear || yearHint || undefined,
-          container,
+          year: record.year || yearHint || undefined,
+          container: record.container,
           sources,
           driftFields,
           fieldDiffs,
+          fieldChecks,
           links,
           record,
           formats: formatsFromRecord(record, authorHint),
@@ -901,7 +1230,7 @@ async function verifyOne(raw: string, index: number): Promise<CiteResult> {
     const dc = await lookupDatacite(doi);
     if (dc) {
       sources.push("数据登记");
-      compareCitedToResolved(
+      const fieldChecks = compareCitedToResolved(
         fieldDiffs,
         driftFields,
         compareOpts({
@@ -928,7 +1257,7 @@ async function verifyOne(raw: string, index: number): Promise<CiteResult> {
         status: driftFields.length ? "review" : "ok",
         message: driftFields.length
           ? "DOI 在数据登记库命中，但字段存在偏差，请复核。"
-          : "DOI 在数据登记库命中。右侧可直接核对库内信息。",
+          : "DOI 在数据登记库命中；可核字段已核对一致。",
         title: dc.title,
         firstAuthor: dc.firstAuthor,
         doi: dc.doi || doi,
@@ -937,6 +1266,7 @@ async function verifyOne(raw: string, index: number): Promise<CiteResult> {
         sources,
         driftFields,
         fieldDiffs,
+        fieldChecks,
         links,
         record,
         formats: formatsFromRecord(record, authorHint),
@@ -946,7 +1276,7 @@ async function verifyOne(raw: string, index: number): Promise<CiteResult> {
     const oaHit = await lookupOpenAlexByDoi(doi);
     if (oaHit) {
       sources.push("文献库");
-      compareCitedToResolved(
+      const fieldChecks = compareCitedToResolved(
         fieldDiffs,
         driftFields,
         compareOpts({
@@ -966,7 +1296,7 @@ async function verifyOne(raw: string, index: number): Promise<CiteResult> {
         status: driftFields.length ? "review" : "ok",
         message: driftFields.length
           ? "DOI 在文献库命中，但字段存在偏差，请复核。"
-          : "DOI 在文献库命中。右侧可直接核对库内信息页。",
+          : "DOI 在文献库命中；作者/标题/年份/期刊/卷期页已逐项核对。",
         title: oaHit.title,
         firstAuthor: oaHit.firstAuthor,
         doi: oaHit.doi || doi,
@@ -975,6 +1305,7 @@ async function verifyOne(raw: string, index: number): Promise<CiteResult> {
         sources,
         driftFields,
         fieldDiffs,
+        fieldChecks,
         links,
         record: oaHit,
         formats: formatsFromRecord(oaHit, authorHint),
@@ -1032,19 +1363,161 @@ async function verifyOne(raw: string, index: number): Promise<CiteResult> {
     };
   }
 
-  // No DOI: fuzzy title search
+  // ——— PMID primary (no DOI in citation) ———
+  if (pmidHint) {
+    links.push({ label: "PubMed", url: `https://pubmed.ncbi.nlm.nih.gov/${pmidHint}/` });
+    const { record: resolved, secondHit } = await resolveByPmid(pmidHint);
+
+    if (!resolved) {
+      // Dead PMID: still try title so user can compare, but mark risk
+      pushDiff(fieldDiffs, driftFields, "pmid", "PMID", pmidHint, "未找到", 0);
+      const titleHits = await searchNoIdCandidates(
+        { titleHint, authorHint, yearHint, containerHint: biblioHint.container },
+        2,
+      );
+      const best = titleHits[0];
+      if (best && best.composite >= 0.72) {
+        const fieldChecks = compareCitedToResolved(
+          fieldDiffs,
+          driftFields,
+          compareOpts(
+            {
+              title: best.title,
+              firstAuthor: best.firstAuthor,
+              year: best.year,
+              container: best.container,
+              volume: best.volume,
+              issue: best.issue,
+              pages: best.pages,
+              pmid: best.pmid,
+            },
+            false,
+          ),
+        );
+        if (best.doi) links.push({ label: "原文", url: `https://doi.org/${best.doi}` });
+        return {
+          index,
+          raw,
+          status: "risk",
+          message: `PMID 多源未找到（疑似错误）。按标题找到接近文献（综合 ${Math.round(best.composite * 100)}%），请核对是否为同一篇。`,
+          title: titleHint,
+          firstAuthor: authorHint,
+          year: yearHint || undefined,
+          doi: best.doi,
+          sources: best.sources,
+          driftFields,
+          fieldDiffs,
+          fieldChecks,
+          links,
+          record: best,
+          formats: { ...EMPTY_FORMATS },
+        };
+      }
+      return {
+        index,
+        raw,
+        status: "risk",
+        message: "提供了 PMID，但多源均未找到对应记录，且标题也无足够接近匹配，疑似错误或虚构 PMID。",
+        title: titleHint,
+        firstAuthor: authorHint,
+        year: yearHint || undefined,
+        sources: [],
+        driftFields: ["pmid"],
+        fieldDiffs,
+        links,
+        record: null,
+        formats: { ...EMPTY_FORMATS },
+      };
+    }
+
+    sources.push(...resolved.sources);
+    if (resolved.doi) links.push({ label: "原文", url: `https://doi.org/${resolved.doi}` });
+
+    // Cited PMID must match resolved (always should for direct lookup)
+    if (resolved.pmid && resolved.pmid !== pmidHint) {
+      pushDiff(fieldDiffs, driftFields, "pmid", "PMID", pmidHint, resolved.pmid, 0);
+    }
+
+    const fieldChecks = compareCitedToResolved(
+      fieldDiffs,
+      driftFields,
+      compareOpts({
+        title: resolved.title,
+        firstAuthor: resolved.firstAuthor,
+        year: resolved.year,
+        container: resolved.container,
+        volume: resolved.volume,
+        issue: resolved.issue,
+        pages: resolved.pages,
+        pmid: resolved.pmid || pmidHint,
+      }),
+    );
+
+    const status: CiteStatus = driftFields.length
+      ? driftFields.includes("pmid")
+        ? "risk"
+        : "review"
+      : secondHit
+        ? "ok"
+        : "review";
+
+    return {
+      index,
+      raw,
+      status,
+      message: driftFields.length
+        ? `PMID 可解析，但字段与库内记录不一致（${driftFields.map(driftLabel).join("、")}），请人工复核。`
+        : secondHit
+          ? "PMID 有效，多源命中；作者/标题/年份/期刊/卷期页已逐项核对一致。"
+          : "PMID 有效；已按医学索引核对字段，建议再对照右侧库内信息。",
+      title: resolved.title,
+      firstAuthor: resolved.firstAuthor,
+      doi: resolved.doi,
+      year: resolved.year || yearHint || undefined,
+      container: resolved.container,
+      sources,
+      driftFields,
+      fieldDiffs,
+      fieldChecks,
+      links,
+      record: resolved,
+      formats: formatsFromRecord(resolved, authorHint),
+    };
+  }
+
+  // ——— No DOI and no PMID: multi-source bibliographic match ———
   try {
-    const ranked = await searchTitleCandidates(titleHint, 3);
+    if (!titleHint || titleHint.length < 12) {
+      return {
+        index,
+        raw,
+        status: "insufficient",
+        message: "无 DOI/PMID，且无法从引用中提取足够标题，缺少核对锚点。请补 DOI、PMID 或完整题名。",
+        year: yearHint || undefined,
+        firstAuthor: authorHint,
+        sources: [],
+        driftFields: [],
+        fieldDiffs: [],
+        links: [],
+        record: null,
+        formats: { ...EMPTY_FORMATS },
+      };
+    }
+
+    const ranked = await searchNoIdCandidates(
+      { titleHint, authorHint, yearHint, containerHint: biblioHint.container },
+      5,
+    );
     const best = ranked[0];
 
-    if (!best || (best.matchScore || 0) < 0.35) {
+    if (!best || best.composite < 0.55) {
       pushDiff(fieldDiffs, driftFields, "doi", "DOI", "缺失", "未匹配", 0);
       pushDiff(fieldDiffs, driftFields, "title", "标题", titleHint.slice(0, 80), "无接近匹配", 0);
       return {
         index,
         raw,
         status: "risk",
-        message: "无 DOI，且未能找到足够接近的文献匹配，请核对或补上 DOI。",
+        message: "无 DOI/PMID，且多源（文献库/医学索引/登记库）均未找到足够接近的文献，请核对题名或补上标识符。",
         year: yearHint || undefined,
         title: titleHint,
         firstAuthor: authorHint,
@@ -1057,51 +1530,124 @@ async function verifyOne(raw: string, index: number): Promise<CiteResult> {
       };
     }
 
-    sources.push(...best.sources);
-    const resolvedDoi = best.doi;
-    pushDiff(fieldDiffs, driftFields, "doi", "DOI", "缺失", resolvedDoi || "仍缺失", resolvedDoi ? 0.5 : 0);
-    compareCitedToResolved(
+    // If match yielded a durable ID, re-resolve for authoritative metadata
+    let record: SourceRecord = best;
+    let secondHit = best.sources.length > 1;
+    if (best.doi) {
+      const cr = await lookupCrossrefByDoi(best.doi);
+      const oa = await lookupOpenAlexByDoi(best.doi);
+      if (cr) {
+        record = overlayRecord(record, cr);
+        secondHit = true;
+      }
+      if (oa) {
+        record = overlayRecord(record, oa);
+        secondHit = true;
+      }
+    } else if (best.pmid) {
+      const byPmid = await resolveByPmid(best.pmid);
+      if (byPmid.record) {
+        record = overlayRecord(record, byPmid.record);
+        secondHit = secondHit || byPmid.secondHit;
+      }
+    }
+
+    sources.push(...record.sources);
+    const resolvedDoi = record.doi;
+    const resolvedPmid = record.pmid;
+
+    // Only flag DOI when we still cannot recover one
+    if (!resolvedDoi) {
+      pushDiff(fieldDiffs, driftFields, "doi", "DOI", "缺失", "仍缺失", 0);
+    }
+
+    const fieldChecks = compareCitedToResolved(
       fieldDiffs,
       driftFields,
       compareOpts(
         {
-          title: best.title,
-          firstAuthor: best.firstAuthor,
-          year: best.year,
-          container: best.container,
-          volume: best.volume,
-          issue: best.issue,
-          pages: best.pages,
-          pmid: best.pmid,
+          title: record.title,
+          firstAuthor: record.firstAuthor,
+          year: record.year,
+          container: record.container,
+          volume: record.volume,
+          issue: record.issue,
+          pages: record.pages,
+          pmid: record.pmid,
         },
-        false,
+        Boolean(resolvedDoi || resolvedPmid),
       ),
     );
-    if (resolvedDoi) links.push({ label: "原文", url: `https://doi.org/${resolvedDoi}` });
 
-    const score = best.matchScore || 0;
-    const status: CiteStatus =
-      score >= 0.85 || (score >= 0.7 && Boolean(resolvedDoi)) ? "review" : "insufficient";
+    if (resolvedDoi && !fieldChecks.some((c) => c.field === "doi")) {
+      fieldChecks.unshift({
+        field: "doi",
+        label: "DOI",
+        cited: "（引用中无）",
+        resolved: resolvedDoi,
+        matchScore: 1,
+        ok: true,
+        citedMissing: true,
+      });
+    }
+    if (resolvedPmid && !fieldChecks.some((c) => c.field === "pmid")) {
+      fieldChecks.push({
+        field: "pmid",
+        label: "PMID",
+        cited: "（引用中无）",
+        resolved: resolvedPmid,
+        matchScore: 1,
+        ok: true,
+        citedMissing: true,
+      });
+    }
+
+    if (resolvedDoi) links.push({ label: "原文", url: `https://doi.org/${resolvedDoi}` });
+    if (resolvedPmid) links.push({ label: "PubMed", url: `https://pubmed.ncbi.nlm.nih.gov/${resolvedPmid}/` });
+
+    const hasDurableId = Boolean(resolvedDoi || resolvedPmid);
+    const titleScore = titleSimilarityScore(titleHint, record.title);
+    const strong = best.composite >= 0.82 && titleScore >= 0.85;
+    const medium = best.composite >= 0.65;
+
+    let status: CiteStatus;
+    if (!driftFields.length && hasDurableId && strong && secondHit) {
+      status = "ok";
+    } else if (strong || (medium && hasDurableId)) {
+      status = "review";
+    } else {
+      status = "insufficient";
+    }
+    if (driftFields.length && status === "ok") status = "review";
 
     return {
       index,
       raw,
       status,
       message:
-        score >= 0.85 || score >= 0.7
-          ? "缺少可靠 DOI，仅按标题模糊匹配。右侧库内信息页供核对。"
-          : "缺少 DOI，仅弱匹配到可能相关文献，证据不足。",
-      title: best.title,
-      firstAuthor: best.firstAuthor,
+        status === "ok"
+          ? `引用未含 DOI/PMID，已多源匹配到文献并补全标识符；作者/标题/年份/卷期页核对一致（综合 ${Math.round(best.composite * 100)}%）。`
+          : status === "review"
+            ? `引用未含 DOI/PMID，已按题名等多源匹配（综合 ${Math.round(best.composite * 100)}%）。${
+                driftFields.length
+                  ? `字段不一致：${driftFields.map(driftLabel).join("、")}。`
+                  : hasDurableId
+                    ? "已补全库内标识符，请人工确认是否同一篇。"
+                    : "未补全可靠标识符，请人工确认。"
+              }`
+            : `无 DOI/PMID，仅弱匹配到可能相关文献（综合 ${Math.round(best.composite * 100)}%），证据不足。`,
+      title: record.title,
+      firstAuthor: record.firstAuthor,
       doi: resolvedDoi,
-      year: best.year || yearHint || undefined,
-      container: best.container,
+      year: record.year || yearHint || undefined,
+      container: record.container,
       sources,
       driftFields,
       fieldDiffs,
+      fieldChecks,
       links,
-      record: best,
-      formats: formatsFromRecord(best, authorHint),
+      record,
+      formats: status === "insufficient" ? { ...EMPTY_FORMATS } : formatsFromRecord(record, authorHint),
     };
   } catch {
     return {
