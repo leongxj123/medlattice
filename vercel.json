@@ -1,0 +1,25 @@
+{
+  "functions": {
+    "src/app/api/citations/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/match/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/papers/route.ts": {
+      "maxDuration": 30
+    },
+    "src/app/api/map/route.ts": {
+      "maxDuration": 30
+    },
+    "src/app/api/journals/[id]/route.ts": {
+      "maxDuration": 30
+    },
+    "src/app/api/datasets/route.ts": {
+      "maxDuration": 30
+    },
+    "src/app/api/trials/route.ts": {
+      "maxDuration": 30
+    }
+  }
+}
