@@ -6,6 +6,9 @@
     "src/app/api/match/route.ts": {
       "maxDuration": 60
     },
+    "src/app/api/pdf/route.ts": {
+      "maxDuration": 30
+    },
     "src/app/api/papers/route.ts": {
       "maxDuration": 30
     },

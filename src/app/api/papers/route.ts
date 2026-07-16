@@ -11,6 +11,7 @@ import {
   type JournalMetrics,
   type S2Paper,
 } from "@/lib/http";
+import { pdfGateAbsolute } from "@/lib/pdfGate";
 
 type PaperResult = {
   id: string;
@@ -28,9 +29,24 @@ type PaperResult = {
   url?: string;
   journal?: JournalMetrics | null;
   oaPdfUrl?: string;
+  /** WeChat-friendly jump URL on this site (302 → real PDF) */
+  pdfJumpUrl?: string;
+  /** Same-origin proxy for wx.downloadFile (small PDFs only) */
+  pdfProxyUrl?: string;
   oaLandingUrl?: string;
   europePmcUrl?: string;
 };
+
+function withPdfGate(results: PaperResult[], origin: string): PaperResult[] {
+  return results.map((r) => {
+    if (!r.oaPdfUrl) return r;
+    return {
+      ...r,
+      pdfJumpUrl: pdfGateAbsolute(r.oaPdfUrl, { mode: "redirect", doi: r.doi, origin }),
+      pdfProxyUrl: pdfGateAbsolute(r.oaPdfUrl, { mode: "proxy", doi: r.doi, origin }),
+    };
+  });
+}
 
 function fromS2(p: S2Paper): PaperResult {
   const title = p.title || "Untitled";
@@ -94,6 +110,7 @@ async function enrichResults(results: PaperResult[], limit = 15) {
 export async function GET(req: NextRequest) {
   try {
     const sp = req.nextUrl.searchParams;
+    const origin = `${req.nextUrl.protocol}//${req.nextUrl.host}`;
     const q = sp.get("q")?.trim();
     if (!q) {
       return NextResponse.json({ error: "请输入关键词、DOI 或 PMID", results: [], total: 0 }, { status: 400 });
@@ -178,7 +195,7 @@ export async function GET(req: NextRequest) {
         page: 1,
         sourcesUsed: ["api.semanticscholar.org", "eutils.ncbi.nlm.nih.gov", ...enrichmentSources],
         metricsNote: "期刊指标为公开学术统计（2yr mean citedness / h-index），不是 Clarivate JIF / 中科院分区。",
-        results,
+        results: withPdfGate(results, origin),
       });
     }
 
@@ -307,7 +324,7 @@ export async function GET(req: NextRequest) {
       sourcesUsed: [...new Set(sourcesUsed)],
       warning: warnings.length ? warnings.join("；") : null,
       metricsNote: "期刊指标为公开学术统计（2yr mean citedness / h-index），不是 Clarivate JIF / 中科院分区。",
-      results: merged,
+      results: withPdfGate(merged, origin),
     });
   } catch (err) {
     return NextResponse.json(

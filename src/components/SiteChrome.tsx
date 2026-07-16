@@ -67,12 +67,14 @@ export function ToolShell({
   title: string;
   subtitle: string;
   children: React.ReactNode;
-  active: ToolId;
+  active?: ToolId;
 }) {
   return (
     <div className="mx-auto max-w-6xl px-4 py-8 md:px-6 md:py-10">
       <div className="mb-8 max-w-2xl fade-up">
-        <p className="mb-2 text-xs uppercase tracking-[0.18em] text-accent">MedLattice / {active}</p>
+        <p className="mb-2 text-xs uppercase tracking-[0.18em] text-accent">
+          MedLattice{active ? ` / ${active}` : ""}
+        </p>
         <h1 className="font-[family-name:var(--font-display)] text-3xl font-semibold tracking-tight text-ink md:text-4xl">
           {title}
         </h1>

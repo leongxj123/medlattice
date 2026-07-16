@@ -34,6 +34,28 @@ npm run dev
 |------|------|
 | `SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar API Key（请求头 `x-api-key`）。无密钥时易触发限流，查找论文会自动回退到仅 PubMed。 |
 | `MEDLATTICE_CONTACT_EMAIL` | 可选联系邮箱，用于 OpenAlex / Unpaywall 礼貌标识（未设则用占位邮箱）。 |
+| `MEDLATTICE_PUBLIC_URL` | 对外站点根地址，如 `https://med.aispeedtest.eu`；论文 API 会据此生成微信可用的 PDF 跳转/代理绝对链接。 |
+
+## 微信小程序 PDF（统一域名）
+
+Publisher PDF 域名极多，无法全部加到 `downloadFile` 合法域名。本站提供统一入口（只需配置 `med.aispeedtest.eu`）：
+
+| 用途 | URL |
+|------|-----|
+| **跳转打开**（web-view / 浏览器，默认） | `https://med.aispeedtest.eu/api/pdf?url=` + `encodeURIComponent(真实PDF)` |
+| **同域下载**（`wx.downloadFile`，≤约 4.5MB） | 同上并加 `&mode=proxy` |
+| **按 DOI 解析 OA 再跳转** | `https://med.aispeedtest.eu/api/pdf?doi=10.xxxx/...` |
+| **HTML 跳转页**（业务域名） | `https://med.aispeedtest.eu/pdf?url=...` |
+| **返回 JSON 链接** | `&format=json` → `{ jumpUrl, proxyUrl, target }` |
+
+`/api/papers` 结果里若有 OA PDF，会附带 `pdfJumpUrl` / `pdfProxyUrl`，小程序可直接使用。
+
+微信后台建议：
+
+1. **downloadFile 合法域名**：`med.aispeedtest.eu`（用 `mode=proxy`）
+2. **业务域名**（web-view）：`med.aispeedtest.eu`（用默认跳转或 `/pdf?url=`）
+
+注意：微信对 302 后的最终域名有时仍会校验；大文件或跳转被拦时优先用 web-view 打开 `pdfJumpUrl` / `/pdf?url=`。
 
 ## 部署到 Vercel
 
