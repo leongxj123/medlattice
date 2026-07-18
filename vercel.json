@@ -3,25 +3,49 @@
     "src/app/api/citations/route.ts": {
       "maxDuration": 60
     },
+    "src/app/api/v1/citations/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/v1/match/route.ts": {
+      "maxDuration": 60
+    },
     "src/app/api/match/route.ts": {
       "maxDuration": 60
     },
     "src/app/api/pdf/route.ts": {
       "maxDuration": 30
     },
+    "src/app/api/v1/pdf/route.ts": {
+      "maxDuration": 30
+    },
     "src/app/api/papers/route.ts": {
+      "maxDuration": 30
+    },
+    "src/app/api/v1/papers/route.ts": {
       "maxDuration": 30
     },
     "src/app/api/map/route.ts": {
       "maxDuration": 30
     },
+    "src/app/api/v1/map/route.ts": {
+      "maxDuration": 30
+    },
     "src/app/api/journals/[id]/route.ts": {
+      "maxDuration": 30
+    },
+    "src/app/api/v1/journals/[id]/route.ts": {
       "maxDuration": 30
     },
     "src/app/api/datasets/route.ts": {
       "maxDuration": 30
     },
+    "src/app/api/v1/datasets/route.ts": {
+      "maxDuration": 30
+    },
     "src/app/api/trials/route.ts": {
+      "maxDuration": 30
+    },
+    "src/app/api/v1/trials/route.ts": {
       "maxDuration": 30
     }
   }

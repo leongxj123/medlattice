@@ -34,7 +34,84 @@ npm run dev
 |------|------|
 | `SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar API Key（请求头 `x-api-key`）。无密钥时易触发限流，查找论文会自动回退到仅 PubMed。 |
 | `MEDLATTICE_CONTACT_EMAIL` | 可选联系邮箱，用于 OpenAlex / Unpaywall 礼貌标识（未设则用占位邮箱）。 |
-| `MEDLATTICE_PUBLIC_URL` | 对外站点根地址，如 `https://med.aispeedtest.eu`；论文 API 会据此生成微信可用的 PDF 跳转/代理绝对链接。 |
+| `MEDLATTICE_PUBLIC_URL` | 站点根地址，如 `https://med.aispeedtest.eu` |
+| `MEDLATTICE_API_KEY` | 生产必填；`/api/v1/*` 请求头 `X-API-Key` |
+
+站点页面不展示该凭据及相关说明。Agent Skill 从环境变量读取。
+
+`public/robots.txt` 已禁止抓取 `/api/`；接口层对跨站无凭据请求返回 401/403。
+
+## 对外 API（`/api/v1`）
+
+服务端调用；需凭据。成功多为 `{ ok, version, data, meta }`（引文核查为 `summary` + `results`）。
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/api/v1/citations` | GET/POST | 引文核查 |
+| `/api/v1/match` | POST | 引文匹配 `{ "text": "..." }` |
+| `/api/v1/papers` | GET | 查找论文 `?q=&sort=&since=&oa=&page=` |
+| `/api/v1/map` | GET | 文献图谱 `?q=` |
+| `/api/v1/datasets` | GET | 数据检索 `?q=` |
+| `/api/v1/journals` | GET | 选刊列表 `?q=` |
+| `/api/v1/journals/{id}` | GET | 选刊详情 |
+| `/api/v1/trials` | GET | 试验桥接 `?q=&mode=` |
+| `/api/v1/search` | GET | 轻量检索 `?q=` |
+| `/api/v1/pdf` | GET | PDF 跳转/代理 `?url=` / `?doi=` |
+
+站内页面仍走 `/api/papers`、`/api/match` 等路径（同源浏览器可访问）。
+
+### 引文核查（`/api/v1/citations`）
+
+| | |
+|--|--|
+| **POST** | 核查参考文献 |
+| **GET** | 返回 JSON 使用说明（便于联调） |
+| **限额** | 单次最多 15 条；总文本 ≤ 30 000 字符 |
+
+**请求体（三选一）**
+
+```json
+{ "text": "1. Ref A\\n2. Ref B" }
+{ "references": ["Ref A", "Ref B"] }
+{ "reference": "单条参考文献" }
+```
+
+**成功响应**
+
+```json
+{
+  "ok": true,
+  "version": "1",
+  "summary": { "total": 1, "ok": 1, "review": 0, "risk": 0, "insufficient": 0 },
+  "results": [],
+  "meta": { "truncated": false, "count": 1 }
+}
+```
+
+**示例**
+
+```bash
+curl -X POST "https://med.aispeedtest.eu/api/v1/citations" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $MEDLATTICE_API_KEY" \
+  -d '{"references":["Wolchok JD, et al. Overall Survival with Combined Nivolumab and Ipilimumab in Advanced Melanoma. N Engl J Med. 2017;377(14):1345-1356. PMID: 28889792"]}'
+
+curl "https://med.aispeedtest.eu/api/v1/papers?q=pembrolizumab" \
+  -H "X-API-Key: $MEDLATTICE_API_KEY"
+```
+
+### Claude Code Skill
+
+项目内 Skill（Claude Code 自动发现 / 可 `/medlattice` 调用）：
+
+`.claude/skills/medlattice/`
+
+```bash
+node .claude/skills/medlattice/scripts/ml_api.mjs papers --q "pembrolizumab"
+node .claude/skills/medlattice/scripts/ml_api.mjs citations --reference "..."
+```
+
+环境变量：`MEDLATTICE_BASE_URL`（默认 `https://med.aispeedtest.eu`）、`MEDLATTICE_API_KEY`。
 
 ## 微信小程序 PDF（统一域名）
 
